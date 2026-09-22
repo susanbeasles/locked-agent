@@ -1,0 +1,916 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+# shellcheck source=/dev/null
+. "$ROOT/config/defaults.env"
+
+# Keep Docker Sandboxes CLI telemetry off whenever this wrapper calls sbx.
+export SBX_NO_TELEMETRY=1
+
+mkdir -p "$AGENT_SBX_HOME/sessions" "$AGENT_SBX_HOME/results"
+
+err() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || err "missing required command: $1"; }
+
+usage() {
+  cat <<'USAGE'
+agent-sbx - disposable autonomous coding-agent sessions
+
+Core flow:
+  agent-sbx harden
+  agent-sbx doctor
+  agent-sbx create --agent codex --repo /absolute/path/to/repo [--name NAME] [--template TAG]
+  agent-sbx prepare NAME                         # explicit temporary package-registry access
+  agent-sbx checkpoint NAME                      # freeze the clean runnable VM as reset baseline
+  agent-sbx auth NAME
+  agent-sbx run NAME "build X completely"       # you explicitly start the autonomous agent
+  agent-sbx iterate NAME "change A/B/C and rerun everything"
+  agent-sbx export NAME
+  agent-sbx accept NAME                          # validates + applies patch, never stages/commits
+  agent-sbx reject NAME                          # destroys VM + session state
+
+Control / inspection:
+  agent-sbx shell NAME
+  agent-sbx stop NAME
+  agent-sbx reset NAME                           # destroy VM and recreate from clean checkpoint/baseline
+  agent-sbx network-allow NAME host[,host...]
+  agent-sbx network-revoke NAME host[,host...]
+  agent-sbx network-log NAME
+  agent-sbx policy NAME
+  agent-sbx preview NAME SANDBOX_PORT [HOST_PORT]
+  agent-sbx unpreview NAME SANDBOX_PORT [HOST_PORT]
+  agent-sbx status
+  agent-sbx nuke                                  # destructive: wipe ALL Docker Sandboxes state/cache
+
+Optional golden image:
+  agent-sbx build-template codex  local/agent-sbx-codex:1
+  agent-sbx build-template claude local/agent-sbx-claude:1
+
+Security invariants:
+  - no host workspace mount
+  - no clone mode
+  - no host SSH agent forwarding
+  - no shared agent skills
+  - no GitHub/AWS/registry credential injected by this wrapper
+  - deny-all network baseline; model-provider access comes from the built-in agent kit
+  - package/network access is an explicit host-side grant
+  - agent gets a synthetic Git repo, never your real .git/history/config/remotes
+  - output is host-derived from a full workspace copy and reviewed as a patch
+USAGE
+}
+
+session_dir() { printf '%s/sessions/%s' "$AGENT_SBX_HOME" "$1"; }
+result_dir() { printf '%s/results/%s' "$AGENT_SBX_HOME" "$1"; }
+
+checkpoint_tag_for() {
+  local safe
+  safe=$(printf '%s' "$1" | tr '[:upper:]_' '[:lower:]-')
+  printf 'agent-sbx/%s:clean' "$safe"
+}
+
+remove_checkpoint_template() {
+  local tag=${1:-}
+  [ -n "$tag" ] || return 0
+  sbx template rm "$tag" --force >/dev/null 2>&1 && return 0
+  printf 'y\n' | sbx template rm "$tag" >/dev/null 2>&1 || true
+}
+
+valid_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) err "invalid sandbox name '$1' (use A-Z a-z 0-9 . _ -)" ;;
+  esac
+}
+
+abs_dir() {
+  [ -d "$1" ] || err "not a directory: $1"
+  (cd "$1" && pwd -P)
+}
+
+version_ge() {
+  # true when $1 >= $2 for simple x.y.z versions; compatible with macOS/Bash 3.2.
+  local a1 a2 a3 b1 b2 b3
+  local IFS=.
+  read -r a1 a2 a3 <<< "$1"
+  read -r b1 b2 b3 <<< "$2"
+  a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
+  b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
+  [ "$a1" -gt "$b1" ] && return 0
+  [ "$a1" -lt "$b1" ] && return 1
+  [ "$a2" -gt "$b2" ] && return 0
+  [ "$a2" -lt "$b2" ] && return 1
+  [ "$a3" -ge "$b3" ]
+}
+
+sbx_version() {
+  local out
+  out=$(sbx version 2>/dev/null || true)
+  printf '%s\n' "$out" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1
+}
+
+assert_sbx_version() {
+  need sbx
+  local v
+  v=$(sbx_version)
+  [ -n "$v" ] || err "could not determine sbx version"
+  version_ge "$v" "$AGENT_SBX_MIN_VERSION" || err "sbx $v is too old; require >= $AGENT_SBX_MIN_VERSION"
+}
+
+looks_empty_listing() {
+  local out=$1
+  [ -z "${out//[[:space:]]/}" ] && return 0
+  printf '%s\n' "$out" | grep -Eqi 'no (.* )?(servers|secrets|entries|registrations)|none (configured|registered|stored)|empty'
+}
+
+assert_strict_host_boundary() {
+  local ssh skills clip out
+  ssh=$(sbx settings get ssh.agentForwardingEnabled 2>/dev/null || printf 'UNKNOWN')
+  skills=$(sbx settings get skills.defaultMode 2>/dev/null || printf 'UNKNOWN')
+  clip=$(sbx settings get clipboard.imagePaste 2>/dev/null || printf 'UNKNOWN')
+  [ "$ssh" = false ] || err "SSH agent forwarding is not confirmed OFF (value: $ssh). Run: agent-sbx harden"
+  [ "$skills" = off ] || err "shared skills default is not confirmed OFF (value: $skills). Run: agent-sbx harden"
+  [ "$clip" = false ] || err "clipboard image reads are not confirmed OFF (value: $clip). Run: agent-sbx harden"
+
+  if [ "$AGENT_SBX_REQUIRE_EMPTY_GLOBAL_SECRETS" = 1 ]; then
+    out=$(sbx secret ls -g 2>/dev/null || true)
+    looks_empty_listing "$out" || {
+      printf '%s\n' "$out" >&2
+      err 'host-global Docker Sandbox secrets are present or the wrapper could not prove the list empty. Remove them or set AGENT_SBX_REQUIRE_EMPTY_GLOBAL_SECRETS=0 only after reviewing the risk.'
+    }
+  fi
+
+  if [ "$AGENT_SBX_REQUIRE_EMPTY_MCP" = 1 ]; then
+    out=$(sbx mcp ls 2>/dev/null || true)
+    looks_empty_listing "$out" || {
+      printf '%s\n' "$out" >&2
+      err 'Docker Sandbox MCP registrations are present or the wrapper could not prove the list empty. This strict profile does not permit that host integration path.'
+    }
+  fi
+}
+
+read_meta() {
+  local name=$1 key=$2 f
+  f="$(session_dir "$name")/meta/$key"
+  [ -f "$f" ] || err "missing session metadata: $f"
+  cat "$f"
+}
+
+write_meta() {
+  local dir=$1 key=$2 value=$3
+  printf '%s' "$value" > "$dir/meta/$key"
+}
+
+is_protected_rel() {
+  local rel=$1 base
+  base=${rel##*/}
+
+  # Safe examples/templates are allowed.
+  case "$base" in
+    .env.example|.env.sample|.env.template|.env.dist) return 1 ;;
+  esac
+
+  case "$rel" in
+    .git|.git/*|*/.git|*/.git/*) return 0 ;;
+    .idea|.idea/*|*/.idea|*/.idea/*) return 0 ;;
+    .ssh|.ssh/*|*/.ssh|*/.ssh/*) return 0 ;;
+    .aws|.aws/*|*/.aws|*/.aws/*) return 0 ;;
+    .config/gh|.config/gh/*|*/.config/gh|*/.config/gh/*) return 0 ;;
+  esac
+
+  case "$base" in
+    .env|.env.*|.npmrc|credentials|credentials.json|secrets.json|id_rsa|id_ed25519|known_hosts) return 0 ;;
+    *.pem|*.key|*.p12|*.pfx|*.jks|*.keystore) return 0 ;;
+  esac
+
+  return 1
+}
+
+copy_one() {
+  local src=$1 dst=$2
+  mkdir -p "$(dirname "$dst")"
+  if [ -L "$src" ]; then
+    cp -P "$src" "$dst"
+  elif [ -f "$src" ]; then
+    cp -p "$src" "$dst"
+  else
+    return 1
+  fi
+}
+
+snapshot_repo() {
+  # Copy current working-tree state (tracked + nonignored untracked), not .git and not ignored secrets.
+  local repo=$1 out=$2 excluded=$3 rel src dst
+  rm -rf "$out"
+  mkdir -p "$out"
+  : > "$excluded"
+
+  git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || err "not a Git working tree: $repo"
+
+  while IFS= read -r -d '' rel; do
+    src="$repo/$rel"
+    dst="$out/$rel"
+
+    if is_protected_rel "$rel"; then
+      printf '%s\n' "$rel" >> "$excluded"
+      continue
+    fi
+
+    # A cached directory entry is normally a submodule. Never recursively copy it or its .git metadata.
+    if [ -d "$src" ] && [ ! -L "$src" ]; then
+      printf '%s\t%s\n' "$rel" 'SKIPPED_DIRECTORY_OR_SUBMODULE' >> "$excluded"
+      continue
+    fi
+
+    # Deleted tracked files simply do not exist in the current working tree.
+    if [ -e "$src" ] || [ -L "$src" ]; then
+      copy_one "$src" "$dst" || true
+    fi
+  done < <(git -C "$repo" ls-files -c -o --exclude-standard -z)
+
+  # If .yarnrc.yml contains inline auth material, remove it from the snapshot.
+  if [ -f "$out/.yarnrc.yml" ] && grep -Eq 'npmAuth(Token|Ident)|unsafeHttpWhitelist' "$out/.yarnrc.yml"; then
+    rm -f "$out/.yarnrc.yml"
+    printf '%s\t%s\n' '.yarnrc.yml' 'REMOVED_AUTH_BEARING_CONFIG' >> "$excluded"
+  fi
+}
+
+make_synthetic_git() {
+  local dir=$1
+  git -C "$dir" init -q
+  git -C "$dir" config user.name 'agent-sbx baseline'
+  git -C "$dir" config user.email 'agent-sbx@invalid'
+  git -C "$dir" config commit.gpgsign false
+  git -C "$dir" add -A
+  GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' \
+  GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' \
+    git -C "$dir" commit -q --allow-empty -m 'AGENT_SBX_BASELINE'
+}
+
+create_vm_from_snapshot() {
+  local name=$1 agent=$2 template=$3 sdir snap args
+  sdir=$(session_dir "$name")
+  snap="$sdir/snapshot.tar"
+
+  args=(create --name "$name" --skills=off)
+  if [ "$AGENT_SBX_CPUS" != "0" ] && [ -n "$AGENT_SBX_CPUS" ]; then
+    args+=(--cpus "$AGENT_SBX_CPUS")
+  fi
+  if [ -n "$AGENT_SBX_MEMORY" ]; then
+    args+=(--memory "$AGENT_SBX_MEMORY")
+  fi
+  if [ -n "$template" ]; then
+    args+=(--template "$template")
+  fi
+  args+=("$agent")
+
+  # No workspace path is intentionally supplied.
+  sbx "${args[@]}"
+
+  sbx cp "$snap" "$name:/tmp/agent-sbx-snapshot.tar"
+  sbx exec "$name" bash -lc '
+    set -euo pipefail
+    mkdir -p /home/agent/workspace
+    find /home/agent/workspace -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    tar -xf /tmp/agent-sbx-snapshot.tar -C /home/agent/workspace
+    rm -f /tmp/agent-sbx-snapshot.tar
+    cd /home/agent/workspace
+    git init -q
+    git config user.name "sandbox-agent"
+    git config user.email "sandbox-agent@invalid"
+    git config commit.gpgsign false
+    git add -A
+    GIT_AUTHOR_DATE="2000-01-01T00:00:00Z" GIT_COMMITTER_DATE="2000-01-01T00:00:00Z" \
+      git commit -q --allow-empty -m "AGENT_SBX_BASELINE"
+    git tag -f AGENT_SBX_BASELINE >/dev/null
+  '
+
+  sbx policy ls "$name" --wide > "$sdir/policy-at-create.txt" 2>&1 || true
+  sbx policy ls "$name" --source kit --type network --wide > "$sdir/kit-network-at-create.txt" 2>&1 || true
+  sbx stop "$name" >/dev/null 2>&1 || true
+}
+
+create_vm_from_checkpoint() {
+  local name=$1 agent=$2 checkpoint=$3 sdir args
+  sdir=$(session_dir "$name")
+  args=(create --name "$name" --skills=off --template "$checkpoint")
+  if [ "$AGENT_SBX_CPUS" != "0" ] && [ -n "$AGENT_SBX_CPUS" ]; then
+    args+=(--cpus "$AGENT_SBX_CPUS")
+  fi
+  if [ -n "$AGENT_SBX_MEMORY" ]; then
+    args+=(--memory "$AGENT_SBX_MEMORY")
+  fi
+  args+=("$agent")
+
+  # The checkpoint is itself a full sandbox filesystem snapshot. No host path is mounted.
+  sbx "${args[@]}"
+  sbx exec "$name" bash -lc 'test -d /home/agent/workspace && test -d /home/agent/workspace/.git'
+  sbx policy ls "$name" --wide > "$sdir/policy-at-reset.txt" 2>&1 || true
+  sbx stop "$name" >/dev/null 2>&1 || true
+}
+
+cmd_harden() {
+  assert_sbx_version
+  info 'Applying host-side Docker Sandboxes hardening...'
+  sbx policy init deny-all
+  sbx settings set ssh.agentForwardingEnabled false
+  sbx settings set skills.defaultMode off
+  sbx settings set clipboard.imagePaste false
+  sbx settings set claude.remoteControl false >/dev/null 2>&1 || true
+  sbx daemon restart >/dev/null 2>&1 || true
+  info ''
+  info 'Active network policy:'
+  sbx policy ls --wide || true
+  info ''
+  info 'Host-global secrets (for this threat model this should be EMPTY):'
+  sbx secret ls -g || true
+  info ''
+  info 'Registered MCP servers (for this threat model this should be EMPTY):'
+  sbx mcp ls || true
+  info ''
+  info 'Hardening applied. This wrapper also exports SBX_NO_TELEMETRY=1 for every invocation.'
+}
+
+cmd_doctor() {
+  need git
+  need rsync
+  need tar
+  assert_sbx_version
+  local v
+  v=$(sbx_version)
+  info "sbx version: $v (minimum: $AGENT_SBX_MIN_VERSION)"
+  info "SSH agent forwarding: $(sbx settings get ssh.agentForwardingEnabled 2>/dev/null || echo UNKNOWN)"
+  info "Shared skills default: $(sbx settings get skills.defaultMode 2>/dev/null || echo UNKNOWN)"
+  info "Clipboard image paste: $(sbx settings get clipboard.imagePaste 2>/dev/null || echo UNKNOWN)"
+  info ''
+  info 'Network policy:'
+  sbx policy ls --wide || true
+  info ''
+  info 'Host-global secrets (must be empty for the strict profile):'
+  sbx secret ls -g || true
+  info ''
+  info 'MCP registrations (must be empty for the strict profile):'
+  sbx mcp ls || true
+  info ''
+  info 'Doctor does not modify anything.'
+}
+
+cmd_create() {
+  assert_sbx_version
+  assert_strict_host_boundary
+  need git
+  local agent='' repo='' name='' template=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent) agent=${2:-}; shift 2 ;;
+      --repo) repo=${2:-}; shift 2 ;;
+      --name) name=${2:-}; shift 2 ;;
+      --template) template=${2:-}; shift 2 ;;
+      *) err "unknown create argument: $1" ;;
+    esac
+  done
+  [ "$agent" = codex ] || [ "$agent" = claude ] || err '--agent must be codex or claude'
+  [ -n "$repo" ] || err '--repo is required'
+  repo=$(abs_dir "$repo")
+  [ -n "$name" ] || name="agent-$(basename "$repo")-$(date +%Y%m%d%H%M%S)"
+  valid_name "$name"
+
+  if [ -z "$template" ]; then
+    if [ "$agent" = codex ]; then template=$AGENT_SBX_CODEX_TEMPLATE; else template=$AGENT_SBX_CLAUDE_TEMPLATE; fi
+  fi
+
+  local sdir baseline excluded head branch tree
+  sdir=$(session_dir "$name")
+  [ ! -e "$sdir" ] || err "session already exists: $name"
+  mkdir -p "$sdir/meta"
+  baseline="$sdir/baseline"
+  excluded="$sdir/excluded-from-snapshot.txt"
+
+  info "Creating sanitized snapshot from current working tree: $repo"
+  snapshot_repo "$repo" "$baseline" "$excluded"
+  make_synthetic_git "$baseline"
+  tree=$(git -C "$baseline" rev-parse 'HEAD^{tree}')
+  head=$(git -C "$repo" rev-parse HEAD 2>/dev/null || printf 'UNBORN')
+  branch=$(git -C "$repo" symbolic-ref --short -q HEAD 2>/dev/null || printf 'DETACHED')
+  git -C "$baseline" archive --format=tar HEAD > "$sdir/snapshot.tar"
+
+  write_meta "$sdir" repo "$repo"
+  write_meta "$sdir" agent "$agent"
+  write_meta "$sdir" template "$template"
+  write_meta "$sdir" baseline_tree "$tree"
+  write_meta "$sdir" host_head "$head"
+  write_meta "$sdir" host_branch "$branch"
+  write_meta "$sdir" created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  write_meta "$sdir" started 0
+  write_meta "$sdir" authenticated 0
+  write_meta "$sdir" checkpoint ''
+
+  info "Creating mountless $agent sandbox '$name'..."
+  create_vm_from_snapshot "$name" "$agent" "$template"
+
+  info ''
+  info "Created: $name"
+  info "Baseline tree: $tree"
+  info "Excluded paths report: $excluded"
+  info 'The agent has NOT been authenticated or started.'
+  info "Next: agent-sbx prepare $name   # if dependencies need bootstrap"
+  info "Then: agent-sbx checkpoint $name && agent-sbx auth $name"
+}
+
+cmd_auth() {
+  assert_sbx_version
+  local name=${1:-}
+  [ -n "$name" ] || err 'usage: agent-sbx auth NAME'
+  valid_name "$name"
+  local agent service
+  agent=$(read_meta "$name" agent)
+  case "$agent" in
+    codex) service=openai ;;
+    claude) service=anthropic ;;
+    *) err "unsupported agent in session: $agent" ;;
+  esac
+  info "Storing a $service credential scoped ONLY to sandbox '$name'."
+  info 'The real value remains in the host credential store/proxy and is not written into the VM filesystem.'
+  sbx secret set "$service" --sandbox "$name"
+  write_meta "$(session_dir "$name")" authenticated 1
+}
+
+prepare_script='set -euo pipefail
+cd /home/agent/workspace
+if [ ! -f package.json ]; then
+  echo "No package.json; nothing to prepare automatically."
+  exit 0
+fi
+pm=$(node -e '\''try{let p=require("./package.json");process.stdout.write(p.packageManager||"")}catch(e){}'\'')
+case "$pm" in
+  yarn@*) corepack enable; yarn_major=$(yarn --version | cut -d. -f1); if [ "$yarn_major" -ge 2 ]; then yarn install --immutable; else yarn install --frozen-lockfile; fi ;;
+  pnpm@*) corepack enable; pnpm install --frozen-lockfile ;;
+  npm@*) npm ci ;;
+  *)
+    if [ -f yarn.lock ]; then corepack enable; yarn_major=$(yarn --version | cut -d. -f1); if [ "$yarn_major" -ge 2 ]; then yarn install --immutable; else yarn install --frozen-lockfile; fi
+    elif [ -f pnpm-lock.yaml ]; then corepack enable; pnpm install --frozen-lockfile
+    elif [ -f package-lock.json ]; then npm ci
+    else echo "No recognized lockfile; refusing non-deterministic dependency install." >&2; exit 2
+    fi
+    ;;
+esac'
+
+cmd_prepare() {
+  assert_sbx_version
+  local name=${1:-}; shift || true
+  [ -n "$name" ] || err 'usage: agent-sbx prepare NAME [--allow hosts] [--cmd command]'
+  local hosts=$AGENT_SBX_PREPARE_HOSTS command=$prepare_script
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --allow) hosts=${2:-}; shift 2 ;;
+      --cmd) command=${2:-}; shift 2 ;;
+      *) err "unknown prepare argument: $1" ;;
+    esac
+  done
+  [ -n "$hosts" ] || err 'prepare host list is empty'
+
+  info "This will TEMPORARILY allow outbound network from '$name' to:"
+  info "  $hosts"
+  printf 'Type ALLOW to continue: '
+  local answer
+  IFS= read -r answer
+  [ "$answer" = ALLOW ] || err 'not approved'
+
+  sbx policy allow network --sandbox "$name" "$hosts"
+  cleanup_prepare_rule() {
+    sbx policy rm network --sandbox "$name" --resource "$hosts" >/dev/null 2>&1 || true
+  }
+  trap cleanup_prepare_rule EXIT INT TERM
+
+  sbx exec -w /home/agent/workspace "$name" bash -lc "$command"
+  cleanup_prepare_rule
+  trap - EXIT INT TERM
+  info 'Dependency bootstrap complete; temporary network rule removed.'
+}
+
+cmd_checkpoint() {
+  assert_sbx_version
+  local name=${1:-}
+  [ -n "$name" ] || err 'usage: agent-sbx checkpoint NAME'
+  valid_name "$name"
+  local sdir started authenticated existing tag
+  sdir=$(session_dir "$name")
+  [ -d "$sdir" ] || err "unknown session: $name"
+  started=$(read_meta "$name" started)
+  authenticated=$(read_meta "$name" authenticated)
+  [ "$started" = 0 ] || err 'checkpoint is only allowed before the coding agent has ever run. Reset first if you need a new clean baseline.'
+  [ "$authenticated" = 0 ] || err 'checkpoint must be taken before agent authentication. Reset/recreate if you already authenticated this session.'
+
+  existing=$(read_meta "$name" checkpoint)
+  [ -z "$existing" ] || err "checkpoint already exists: $existing"
+  tag=$(checkpoint_tag_for "$name")
+  if sbx template inspect "$tag" >/dev/null 2>&1; then
+    err "sandbox template already exists: $tag"
+  fi
+
+  info "Stopping '$name' and freezing its current clean runnable VM as: $tag"
+  sbx stop "$name" >/dev/null 2>&1 || true
+  sbx template save "$name" "$tag"
+  write_meta "$sdir" checkpoint "$tag"
+  write_meta "$sdir" checkpoint_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  info 'Checkpoint saved. Future reset commands recreate this exact prepared environment.'
+  info "Next: agent-sbx auth $name"
+}
+
+build_prompt() {
+  local goal=$1
+  cat <<EOF2
+You are running inside a disposable isolated development VM. You have full autonomy inside /home/agent/workspace and should work continuously until the requested goal is fully implemented and validated.
+
+You may freely edit/delete/create project files, run builds/tests/lints/typechecks, start and stop local services, use the sandbox's private Docker Engine, and change the synthetic Git history inside this VM. Do not stop to ask permission for LOCAL operations. The VM and its Git repository are disposable and are the security boundary.
+
+Network access is intentionally restricted by the host. Do not attempt to evade it. If a required destination is blocked, finish all work possible without it and clearly report the exact hostname/resource needed. Never assume access to the host filesystem, host Git repository, host credentials, SSH agent, GitHub, AWS, or MCP servers.
+
+Before declaring completion, run the project's relevant validation commands and leave /home/agent/workspace in the final deliverable state. Do not merely describe code: implement it.
+
+GOAL:
+$goal
+EOF2
+}
+
+run_agent() {
+  local name=$1 goal=$2 agent prompt
+  agent=$(read_meta "$name" agent)
+  prompt=$(build_prompt "$goal")
+
+  info "About to START autonomous agent '$agent' in sandbox '$name'."
+  info 'Once started, it has full autonomy INSIDE the disposable VM.'
+  printf "Type 'START %s' to run it: " "$name"
+  local answer
+  IFS= read -r answer
+  [ "$answer" = "START $name" ] || err 'not started'
+  write_meta "$(session_dir "$name")" started 1
+
+  set +e
+  if [ "$agent" = codex ]; then
+    sbx run --name "$name" -- --dangerously-bypass-approvals-and-sandbox "$prompt"
+    rc=$?
+  else
+    sbx run --name "$name" -- --dangerously-skip-permissions "$prompt"
+    rc=$?
+  fi
+  set -e
+  sbx stop "$name" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+cmd_run() {
+  local name=${1:-}; shift || true
+  [ -n "$name" ] || err 'usage: agent-sbx run NAME "goal"'
+  [ $# -gt 0 ] || err 'goal text is required'
+  run_agent "$name" "$*"
+}
+
+cmd_iterate() {
+  local name=${1:-}; shift || true
+  [ -n "$name" ] || err 'usage: agent-sbx iterate NAME "follow-up"'
+  [ $# -gt 0 ] || err 'follow-up text is required'
+  run_agent "$name" "$*"
+}
+
+cmd_shell() {
+  local name=${1:-}; [ -n "$name" ] || err 'usage: agent-sbx shell NAME'
+  sbx exec -it -w /home/agent/workspace "$name" bash
+}
+
+cmd_stop() {
+  local name=${1:-}; [ -n "$name" ] || err 'usage: agent-sbx stop NAME'
+  sbx stop "$name"
+}
+
+cmd_policy() {
+  local name=${1:-}; [ -n "$name" ] || err 'usage: agent-sbx policy NAME'
+  sbx policy ls "$name" --wide
+}
+
+cmd_network_allow() {
+  local name=${1:-} hosts=${2:-}
+  [ -n "$name" ] && [ -n "$hosts" ] || err 'usage: agent-sbx network-allow NAME host[,host...]'
+  info "Granting '$name' outbound access to: $hosts"
+  sbx policy allow network --sandbox "$name" "$hosts"
+}
+
+cmd_network_revoke() {
+  local name=${1:-} hosts=${2:-}
+  [ -n "$name" ] && [ -n "$hosts" ] || err 'usage: agent-sbx network-revoke NAME host[,host...]'
+  sbx policy rm network --sandbox "$name" --resource "$hosts"
+}
+
+cmd_network_log() {
+  local name=${1:-}; [ -n "$name" ] || err 'usage: agent-sbx network-log NAME'
+  sbx policy log "$name"
+}
+
+cmd_preview() {
+  local name=${1:-} sport=${2:-} hport=${3:-}
+  [ -n "$name" ] && [ -n "$sport" ] || err 'usage: agent-sbx preview NAME SANDBOX_PORT [HOST_PORT]'
+  if [ -n "$hport" ]; then
+    sbx ports "$name" --publish "$AGENT_SBX_PREVIEW_HOST:$hport:$sport/tcp4"
+  else
+    sbx ports "$name" --publish "$sport"
+  fi
+  sbx ports "$name"
+}
+
+cmd_unpreview() {
+  local name=${1:-} sport=${2:-} hport=${3:-}
+  [ -n "$name" ] && [ -n "$sport" ] || err 'usage: agent-sbx unpreview NAME SANDBOX_PORT [HOST_PORT]'
+  if [ -n "$hport" ]; then
+    sbx ports "$name" --unpublish "$AGENT_SBX_PREVIEW_HOST:$hport:$sport/tcp4"
+  else
+    sbx ports "$name" --unpublish "$sport"
+  fi
+}
+
+strip_protected_candidate_paths() {
+  local candidate=$1 report=$2 rel p
+  : > "$report"
+  while IFS= read -r -d '' p; do
+    rel=${p#"$candidate/"}
+    [ "$rel" != "$p" ] || continue
+    if is_protected_rel "$rel"; then
+      printf '%s\n' "$rel" >> "$report"
+      rm -rf -- "$p"
+    fi
+  done < <(find "$candidate" -print0)
+}
+
+make_risk_report() {
+  local compare=$1 out=$2
+  : > "$out"
+  git -C "$compare" diff --name-only HEAD -- . | while IFS= read -r p; do
+    case "$p" in
+      package.json|*/package.json|package-lock.json|*/package-lock.json|yarn.lock|*/yarn.lock|pnpm-lock.yaml|*/pnpm-lock.yaml|\
+      .github/workflows/*|*/.github/workflows/*|Dockerfile|Dockerfile.*|*/Dockerfile|*/Dockerfile.*|docker-compose.yml|*/docker-compose.yml|compose.yml|*/compose.yml|\
+      *.sh|*.zsh|*.bash|Makefile|*/Makefile|.gitattributes|*/.gitattributes|.gitignore|*/.gitignore|.gitmodules|*/.gitmodules|.husky/*|*/.husky/*)
+        printf '%s\n' "$p" >> "$out"
+        ;;
+    esac
+  done
+}
+
+cmd_export() {
+  need rsync
+  need tar
+  local name=${1:-}; [ -n "$name" ] || err 'usage: agent-sbx export NAME'
+  local sdir rdir tmp copied candidate compare patch
+  sdir=$(session_dir "$name")
+  [ -d "$sdir" ] || err "unknown session: $name"
+  rdir=$(result_dir "$name")
+  rm -rf "$rdir"
+  mkdir -p "$rdir"
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-sbx-export.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+
+  sbx stop "$name" >/dev/null 2>&1 || true
+  mkdir -p "$tmp/copied"
+  sbx cp "$name:/home/agent/workspace" "$tmp/copied"
+  copied="$tmp/copied/workspace"
+  [ -d "$copied" ] || err 'sandbox workspace copy failed'
+  rm -rf "$copied/.git"
+
+  strip_protected_candidate_paths "$copied" "$rdir/quarantined-paths.txt"
+
+  compare="$tmp/compare"
+  mkdir -p "$compare"
+  rsync -a "$sdir/baseline/" "$compare/"
+  rsync -a --checksum --delete --exclude='.git/' "$copied/" "$compare/"
+
+  # Stage the synthetic comparison tree before diffing. Plain `git diff HEAD` does
+  # not include brand-new untracked files, which would silently omit agent-created
+  # source files from the exported patch. This index exists only in quarantine.
+  git -C "$compare" add -A
+
+  patch="$rdir/result.patch"
+  git -C "$compare" diff --cached --binary --no-ext-diff --no-textconv HEAD -- . > "$patch"
+  git -C "$compare" status --short > "$rdir/status.txt"
+  git -C "$compare" diff --cached --stat HEAD -- . > "$rdir/diffstat.txt"
+  git -C "$compare" diff --cached --name-status HEAD -- . > "$rdir/changed-files.txt"
+  git -C "$compare" diff --cached --raw --no-abbrev HEAD -- . > "$rdir/changed-file-modes.txt"
+  make_risk_report "$compare" "$rdir/sensitive-changed-paths.txt"
+
+  # Build the portable finished source tree from the synthetic Git index, not from
+  # the raw runtime workspace. This keeps normal ignored runtime state (for example
+  # node_modules, caches, databases, build scratch space) out of the deliverable while
+  # still including every tracked or newly-added source file represented by the patch.
+  local finished_tree
+  finished_tree=$(git -C "$compare" write-tree)
+  git -C "$compare" archive --format=tar.gz --output="$rdir/finished-codebase.tar.gz" "$finished_tree"
+  cp "$sdir/excluded-from-snapshot.txt" "$rdir/excluded-from-input-snapshot.txt"
+  {
+    printf 'name=%s\n' "$name"
+    for key in agent template baseline_tree host_head host_branch created_at checkpoint checkpoint_at; do
+      if [ -f "$sdir/meta/$key" ]; then printf '%s=%s\n' "$key" "$(cat "$sdir/meta/$key")"; fi
+    done
+  } > "$rdir/session-metadata.txt"
+  sbx policy ls "$name" --wide > "$rdir/network-policy.txt" 2>&1 || true
+  sbx policy log "$name" > "$rdir/network-log.txt" 2>&1 || true
+
+  info "Exported: $rdir"
+  info 'Changed files:'
+  cat "$rdir/changed-files.txt" || true
+  info ''
+  info 'Sensitive paths worth extra review:'
+  if [ -s "$rdir/sensitive-changed-paths.txt" ]; then cat "$rdir/sensitive-changed-paths.txt"; else info '(none flagged)'; fi
+  info ''
+  if [ -s "$rdir/quarantined-paths.txt" ]; then
+    warn 'Protected paths were produced by the agent and were REMOVED from the deliverable:'
+    cat "$rdir/quarantined-paths.txt" >&2
+  fi
+
+  trap - EXIT INT TERM
+  rm -rf "$tmp"
+}
+
+current_host_tree() {
+  local repo=$1 tmp=$2 excluded="$tmp/excluded.txt"
+  snapshot_repo "$repo" "$tmp/tree" "$excluded"
+  make_synthetic_git "$tmp/tree"
+  git -C "$tmp/tree" rev-parse 'HEAD^{tree}'
+}
+
+cmd_accept() {
+  need git
+  local name=${1:-}; [ -n "$name" ] || err 'usage: agent-sbx accept NAME'
+  local sdir rdir repo expected current tmp patch checkpoint
+  sdir=$(session_dir "$name")
+  rdir=$(result_dir "$name")
+  [ -d "$sdir" ] || err "unknown session: $name"
+  [ -f "$rdir/result.patch" ] || cmd_export "$name"
+
+  repo=$(read_meta "$name" repo)
+  expected=$(read_meta "$name" baseline_tree)
+  checkpoint=$(read_meta "$name" checkpoint)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/agent-sbx-accept.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT INT TERM
+  current=$(current_host_tree "$repo" "$tmp")
+  [ "$current" = "$expected" ] || err "host working tree changed since sandbox creation; refusing automatic apply. Expected $expected, got $current. Exported patch remains at $rdir/result.patch"
+
+  patch="$rdir/result.patch"
+  if [ ! -s "$patch" ]; then
+    info 'No changes to apply.'
+    exit 0
+  fi
+
+  # Hard stops for transport mechanisms that deserve explicit manual handling.
+  # Checking raw old/new modes catches edits to an *existing* symlink too; those
+  # do not necessarily produce a "new file mode 120000" line in the patch.
+  if [ -f "$rdir/changed-file-modes.txt" ] && \
+     grep -Eq '^:(120000|160000) |^:[0-9]{6} (120000|160000) ' "$rdir/changed-file-modes.txt"; then
+    err 'patch changes a symlink or gitlink; review/apply manually'
+  fi
+  if grep -Eq '[[:space:]]([^[:space:]]*/)?[.]gitmodules$' "$rdir/changed-files.txt"; then
+    err 'patch changes .gitmodules; review/apply manually'
+  fi
+
+  git -C "$repo" apply --check "$patch"
+  info 'Patch passes git apply --check.'
+  info ''
+  git -C "$repo" apply --stat "$patch"
+  info ''
+  if [ -s "$rdir/sensitive-changed-paths.txt" ]; then
+    warn 'Sensitive paths changed; inspect these before accepting:'
+    cat "$rdir/sensitive-changed-paths.txt" >&2
+  fi
+  printf "Type 'ACCEPT %s' to modify the REAL working tree (nothing will be staged/committed): " "$name"
+  local answer
+  IFS= read -r answer
+  [ "$answer" = "ACCEPT $name" ] || err 'not accepted'
+
+  git -C "$repo" apply --whitespace=nowarn "$patch"
+  info 'Applied to real working tree. Nothing was staged or committed.'
+  git -C "$repo" status --short
+  info 'Destroying disposable sandbox and clean checkpoint...'
+  sbx rm --force "$name" >/dev/null 2>&1 || true
+  remove_checkpoint_template "$checkpoint"
+  rm -rf "$sdir"
+
+  trap - EXIT INT TERM
+  rm -rf "$tmp"
+  info "Audit/result bundle retained at: $rdir"
+}
+
+cmd_reject() {
+  local name=${1:-}; [ -n "$name" ] || err 'usage: agent-sbx reject NAME'
+  valid_name "$name"
+  printf "Type 'REJECT %s' to destroy the sandbox and delete its session/result state: " "$name"
+  local answer
+  IFS= read -r answer
+  [ "$answer" = "REJECT $name" ] || err 'not rejected'
+  local checkpoint=''
+  if [ -f "$(session_dir "$name")/meta/checkpoint" ]; then checkpoint=$(read_meta "$name" checkpoint); fi
+  sbx rm --force "$name" >/dev/null 2>&1 || true
+  remove_checkpoint_template "$checkpoint"
+  rm -rf "$(session_dir "$name")" "$(result_dir "$name")"
+  info 'Rejected and destroyed, including the per-session clean checkpoint.'
+}
+
+cmd_reset() {
+  local name=${1:-}; [ -n "$name" ] || err 'usage: agent-sbx reset NAME'
+  local sdir agent template checkpoint
+  sdir=$(session_dir "$name")
+  [ -d "$sdir" ] || err "unknown session: $name"
+  agent=$(read_meta "$name" agent)
+  template=$(read_meta "$name" template)
+  checkpoint=$(read_meta "$name" checkpoint)
+  printf "Type 'RESET %s' to destroy the VM and recreate its clean baseline: " "$name"
+  local answer
+  IFS= read -r answer
+  [ "$answer" = "RESET $name" ] || err 'not reset'
+  sbx rm --force "$name" >/dev/null 2>&1 || true
+  if [ -n "$checkpoint" ]; then
+    create_vm_from_checkpoint "$name" "$agent" "$checkpoint"
+    info "Recreated from prepared checkpoint: $checkpoint"
+  else
+    create_vm_from_snapshot "$name" "$agent" "$template"
+    info 'Recreated from the original source snapshot. Re-run prepare if dependencies were installed after creation.'
+  fi
+  write_meta "$sdir" started 0
+  write_meta "$sdir" authenticated 0
+  rm -rf "$(result_dir "$name")"
+  info 'Sandbox-scoped model credentials were deleted with the old VM.'
+  info "Run: agent-sbx auth $name"
+}
+
+cmd_status() {
+  sbx ls || true
+  info ''
+  info "Host-side sessions: $AGENT_SBX_HOME/sessions"
+  local d
+  for d in "$AGENT_SBX_HOME/sessions"/*; do
+    [ -d "$d" ] && printf '%s\n' "$d"
+  done
+}
+
+cmd_nuke() {
+  assert_sbx_version
+  warn 'THIS WIPES ALL LOCAL DOCKER SANDBOXES STATE: every sandbox, cached template/image, policy, stored secret, Docker Sandboxes login, and daemon state.'
+  warn 'It does not remove Docker Desktop itself or touch your real Git repositories.'
+  printf "Type 'NUKE ALL SANDBOX STATE' to continue: "
+  local answer
+  IFS= read -r answer
+  [ "$answer" = 'NUKE ALL SANDBOX STATE' ] || err 'not nuked'
+  sbx reset --force
+  rm -rf "$AGENT_SBX_HOME"
+  info 'Docker Sandboxes state/cache and agent-sbx controller state removed.'
+}
+
+cmd_build_template() {
+  need docker
+  assert_sbx_version
+  local agent=${1:-} tag=${2:-}
+  [ "$agent" = codex ] || [ "$agent" = claude ] || err 'usage: agent-sbx build-template codex|claude TAG'
+  [ -n "$tag" ] || err 'template tag is required'
+  local dockerfile tmp
+  dockerfile="$ROOT/templates/$agent.Dockerfile"
+  [ -f "$dockerfile" ] || err "missing $dockerfile"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/agent-sbx-template.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT INT TERM
+  docker build -f "$dockerfile" -t "$tag" "$ROOT/templates"
+  docker image save "$tag" -o "$tmp"
+  sbx template load "$tmp"
+  info "Loaded sandbox template: $tag"
+  info 'Optional cleanup of the host Docker image/tag:'
+  info "  docker image rm '$tag'"
+  trap - EXIT INT TERM
+  rm -f "$tmp"
+}
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    harden) cmd_harden "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    create) cmd_create "$@" ;;
+    auth) cmd_auth "$@" ;;
+    prepare) cmd_prepare "$@" ;;
+    checkpoint) cmd_checkpoint "$@" ;;
+    run) cmd_run "$@" ;;
+    iterate) cmd_iterate "$@" ;;
+    shell) cmd_shell "$@" ;;
+    stop) cmd_stop "$@" ;;
+    reset) cmd_reset "$@" ;;
+    network-allow) cmd_network_allow "$@" ;;
+    network-revoke) cmd_network_revoke "$@" ;;
+    network-log) cmd_network_log "$@" ;;
+    policy) cmd_policy "$@" ;;
+    preview) cmd_preview "$@" ;;
+    unpreview) cmd_unpreview "$@" ;;
+    export) cmd_export "$@" ;;
+    accept) cmd_accept "$@" ;;
+    reject) cmd_reject "$@" ;;
+    status) cmd_status "$@" ;;
+    nuke) cmd_nuke "$@" ;;
+    build-template) cmd_build_template "$@" ;;
+    *) err "unknown command: $cmd (run: agent-sbx help)" ;;
+  esac
+}
+
+main "$@"
